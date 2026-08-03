@@ -1,0 +1,24 @@
+[Unit]
+Description=Sendayan Line 2 Production Tracker
+Wants=network-online.target
+After=network-online.target mosquitto.service
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=%i
+WorkingDirectory=/home/%i/sdy2
+Environment=PYTHONUNBUFFERED=1
+Environment=SDY2_API_ENABLED=false
+EnvironmentFile=-/home/%i/sdy2/.env
+ExecStart=/home/%i/sdy2/.venv/bin/python -u /home/%i/sdy2/sdy2.py
+Restart=always
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=30
+NoNewPrivileges=true
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target
