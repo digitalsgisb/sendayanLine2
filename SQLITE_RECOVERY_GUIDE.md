@@ -5,6 +5,14 @@ The default database is `runtime/sdy2_state.db`. It contains:
 - `runtime_state`: the latest SDY2 shift, counter, timer, mode, and entry-window
   snapshot;
 - `outbox_events`: durable production events waiting for API delivery.
+- `google_queue`: Google Sheets rows and PDF requests not yet accepted by the
+  Apps Script. They are sent in order by a background thread and survive restarts.
+- `settings`: values pushed from Smart Checksheet, such as the Apps Script URL.
+
+Outbox retention: once an hour, events older than 7 days are deleted only if the
+Smart Checksheet relay has delivered them (its `checksheet_deliveries` table)
+and, when `SDY2_API_ENABLED=true`, the API sender marked them `SENT` or
+`DEAD_LETTER`. Until the relay is installed, nothing is deleted.
 
 Counters are checkpointed after accepted counts and operational changes.
 Continuously changing timers are checkpointed every five seconds. On restart,

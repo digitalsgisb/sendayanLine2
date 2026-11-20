@@ -27,6 +27,7 @@ def _parse_production_date(value) -> date:
         return value.date()
     if isinstance(value, date):
         return value
+
     text = str(value or "").strip()
     for date_format in ("%Y-%m-%d", "%Y%m%d"):
         try:
@@ -52,6 +53,7 @@ def calculate_shift_end_datetime(production_date, shift, overtime, working_time)
     production_day = _parse_production_date(production_date)
     normalized_shift = str(shift or "").strip().upper()
     overtime_enabled = coerce_bool(overtime)
+
     try:
         start_time, end_time = _parse_working_time(working_time)
     except ValueError:
@@ -61,6 +63,7 @@ def calculate_shift_end_datetime(production_date, shift, overtime, working_time)
                 f"Cannot determine schedule for shift={shift!r}, overtime={overtime!r}"
             )
         start_time, end_time = _parse_working_time(fallback)
+
     start_datetime = datetime.combine(production_day, start_time)
     end_datetime = datetime.combine(production_day, end_time)
     if end_datetime <= start_datetime:
@@ -76,3 +79,19 @@ def hour_slot_for_shift_end(shift_end: datetime) -> str:
         start_hour = shift_end.hour
         end_hour = (start_hour + 1) % 24
     return f"{start_hour}.00-{end_hour}.00"
+
+
+def calculate_shift_start_datetime(production_date, shift, overtime, working_time) -> datetime:
+    """Return the dated local start, using the same schedule as shift end."""
+    production_day = _parse_production_date(production_date)
+    key = (str(shift or "").strip().upper(), coerce_bool(overtime))
+    if key not in DEFAULT_WORKING_TIMES:
+        raise ValueError("Shift must be Day or Night")
+    expected = _parse_working_time(DEFAULT_WORKING_TIMES[key])
+    try:
+        supplied = _parse_working_time(working_time)
+    except ValueError:
+        supplied = expected
+    if supplied != expected:
+        raise ValueError("Working hours do not match the selected shift and overtime")
+    return datetime.combine(production_day, supplied[0])

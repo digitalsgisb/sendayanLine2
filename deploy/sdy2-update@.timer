@@ -1,0 +1,14 @@
+[Unit]
+Description=Scheduled update of the Sendayan Line 2 tracker for %i
+
+[Timer]
+# One planned rollout. Change this date for the next one, or run it now with:
+#   sudo systemctl start "sdy2-update@$USER.service"
+OnCalendar=2026-11-23 06:00:00
+# If the Pi was off at that time, run once at the next boot (it still waits for a safe moment).
+Persistent=true
+AccuracySec=1s
+Unit=sdy2-update@%i.service
+
+[Install]
+WantedBy=timers.target

@@ -1,3 +1,4 @@
+import json
 import os
 import runpy
 import sys
@@ -31,7 +32,7 @@ class StartupSmokeTests(unittest.TestCase):
         gpio.BCM = gpio.IN = gpio.PUD_UP = 1
         gpio.setmode = lambda *_args, **_kwargs: None
         gpio.setup = lambda *_args, **_kwargs: None
-        gpio.input = lambda *_args, **_kwargs: 0
+        gpio.input = lambda *_args, **_kwargs: 1
         gpio.cleanup = lambda: None
         rpi = types.ModuleType("RPi")
         rpi.GPIO = gpio

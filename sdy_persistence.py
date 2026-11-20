@@ -20,6 +20,8 @@ def utc_now_iso() -> str:
 
 
 class ProductionSQLiteStore:
+    """Thread-safe current-state snapshot plus durable event outbox."""
+
     def __init__(self, database_path: str) -> None:
         self.database_path = os.path.abspath(database_path)
         directory = os.path.dirname(self.database_path)
@@ -27,7 +29,10 @@ class ProductionSQLiteStore:
             os.makedirs(directory, exist_ok=True)
         self._lock = threading.RLock()
         self._connection = sqlite3.connect(
-            self.database_path, timeout=5.0, check_same_thread=False, isolation_level=None
+            self.database_path,
+            timeout=5.0,
+            check_same_thread=False,
+            isolation_level=None,
         )
         self._connection.row_factory = sqlite3.Row
         self._connection.execute("PRAGMA journal_mode=WAL")
@@ -66,6 +71,20 @@ class ProductionSQLiteStore:
                     ON outbox_events(status, next_attempt_at, created_at);
                 CREATE INDEX IF NOT EXISTS idx_outbox_shift
                     ON outbox_events(shift_id, event_type);
+                CREATE TABLE IF NOT EXISTS google_queue (
+                    queue_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    request_id TEXT NOT NULL UNIQUE,
+                    item_json TEXT NOT NULL,
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    next_attempt_at REAL NOT NULL DEFAULT 0,
+                    last_error TEXT,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS settings (
+                    setting_key TEXT PRIMARY KEY,
+                    setting_value TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 """
             )
 
@@ -178,9 +197,9 @@ class ProductionSQLiteStore:
             cursor = self._connection.execute(
                 """
                 UPDATE outbox_events
-                SET status='PENDING', next_attempt_at=?,
-                    last_error=COALESCE(last_error, 'Delivery interrupted by restart')
-                WHERE status='SENDING'
+                SET status = 'PENDING', next_attempt_at = ?,
+                    last_error = COALESCE(last_error, 'Delivery interrupted by restart')
+                WHERE status = 'SENDING'
                 """,
                 (utc_now_iso(),),
             )
@@ -193,7 +212,7 @@ class ProductionSQLiteStore:
                 row = self._connection.execute(
                     """
                     SELECT * FROM outbox_events
-                    WHERE status='PENDING'
+                    WHERE status = 'PENDING'
                       AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
                     ORDER BY created_at, event_id LIMIT 1
                     """,
@@ -205,14 +224,15 @@ class ProductionSQLiteStore:
                 self._connection.execute(
                     """
                     UPDATE outbox_events
-                    SET status='SENDING', attempt_count=attempt_count+1,
-                        last_error=NULL
-                    WHERE event_id=?
+                    SET status = 'SENDING', attempt_count = attempt_count + 1,
+                        last_error = NULL
+                    WHERE event_id = ?
                     """,
                     (row["event_id"],),
                 )
                 claimed = self._connection.execute(
-                    "SELECT * FROM outbox_events WHERE event_id=?", (row["event_id"],)
+                    "SELECT * FROM outbox_events WHERE event_id = ?",
+                    (row["event_id"],),
                 ).fetchone()
                 self._connection.execute("COMMIT")
             except Exception:
@@ -259,6 +279,99 @@ class ProductionSQLiteStore:
         for row in rows:
             counts[row["status"]] = row["total"]
         return counts
+
+    # --- Google Sheets queue: survives restarts, strictly first-in first-out ---
+    def enqueue_google(self, item: Dict[str, Any]) -> bool:
+        """Store one Sheets request. A repeated request_id is ignored (same logical row)."""
+        with self._lock:
+            cursor = self._connection.execute(
+                "INSERT OR IGNORE INTO google_queue (request_id, item_json, created_at) VALUES (?, ?, ?)",
+                (item["request_id"], json.dumps(item, ensure_ascii=False, default=str), utc_now_iso()),
+            )
+            return cursor.rowcount == 1
+
+    def peek_google(self) -> Optional[Dict[str, Any]]:
+        """Oldest queued request; later ones wait so a shift PDF never overtakes its rows."""
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM google_queue ORDER BY queue_id LIMIT 1"
+            ).fetchone()
+        if row is None:
+            return None
+        item = json.loads(row["item_json"])
+        item["queue_id"] = row["queue_id"]
+        item["attempt_count"] = row["attempt_count"]
+        item["next_retry_at"] = row["next_attempt_at"]
+        return item
+
+    def complete_google(self, queue_id: int) -> None:
+        with self._lock:
+            self._connection.execute("DELETE FROM google_queue WHERE queue_id = ?", (queue_id,))
+
+    def retry_google(self, queue_id: int, attempt_count: int, next_attempt_at: float, message: str) -> None:
+        with self._lock:
+            self._connection.execute(
+                "UPDATE google_queue SET attempt_count=?, next_attempt_at=?, last_error=? WHERE queue_id=?",
+                (attempt_count, next_attempt_at, message[:1000], queue_id),
+            )
+
+    def google_queue_count(self) -> int:
+        with self._lock:
+            return self._connection.execute("SELECT COUNT(*) FROM google_queue").fetchone()[0]
+
+    # --- Small key/value settings pushed from Smart Checksheet ---
+    def get_setting(self, key: str) -> Optional[str]:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT setting_value FROM settings WHERE setting_key = ?", (key,)
+            ).fetchone()
+        return None if row is None else row["setting_value"]
+
+    def set_setting(self, key: str, value: Optional[str]) -> None:
+        with self._lock:
+            if value is None:
+                self._connection.execute("DELETE FROM settings WHERE setting_key = ?", (key,))
+            else:
+                self._connection.execute(
+                    """INSERT INTO settings (setting_key, setting_value, updated_at) VALUES (?, ?, ?)
+                    ON CONFLICT(setting_key) DO UPDATE SET
+                        setting_value = excluded.setting_value, updated_at = excluded.updated_at""",
+                    (key, value, utc_now_iso()),
+                )
+
+    # --- Outbox retention ---
+    def prune_finished_events(self, api_enabled: bool, older_than_days: int = 7) -> int:
+        """Delete outbox events older than N days that every consumer has finished with.
+
+        Consumers: the optional analytics API sender (status SENT/DEAD_LETTER, or
+        disabled) and the Smart Checksheet relay, which keeps its own
+        checksheet_deliveries ledger in this database. Until that relay is
+        installed nothing is deleted, so it can still deliver the history.
+        """
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=older_than_days)).isoformat()
+        with self._lock:
+            relay_installed = self._connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='checksheet_deliveries'"
+            ).fetchone() is not None
+            if not relay_installed:
+                return 0
+            api_done = "1" if not api_enabled else "e.status IN ('SENT','DEAD_LETTER')"
+            self._begin()
+            try:
+                event_ids = [row[0] for row in self._connection.execute(
+                    f"""SELECT e.event_id FROM outbox_events e
+                    JOIN checksheet_deliveries d ON d.event_id = e.event_id
+                    WHERE d.delivered_at IS NOT NULL AND e.created_at < ? AND {api_done}""",
+                    (cutoff,),
+                ).fetchall()]
+                for event_id in event_ids:
+                    self._connection.execute("DELETE FROM outbox_events WHERE event_id = ?", (event_id,))
+                    self._connection.execute("DELETE FROM checksheet_deliveries WHERE event_id = ?", (event_id,))
+                self._connection.execute("COMMIT")
+            except Exception:
+                self._rollback()
+                raise
+        return len(event_ids)
 
     def close(self) -> None:
         with self._lock:

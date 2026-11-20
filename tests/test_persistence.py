@@ -27,7 +27,7 @@ class PersistenceTests(unittest.TestCase):
             ).fetchall()
         finally:
             connection.close()
-        self.assertEqual([row[0] for row in rows], ["outbox_events", "runtime_state"])
+        self.assertEqual([row[0] for row in rows], ["google_queue", "outbox_events", "runtime_state", "settings", "sqlite_sequence"])
 
     def test_runtime_state_survives_reopen(self):
         self.store.save_runtime_state(

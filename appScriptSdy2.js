@@ -14,6 +14,97 @@ function jsonOutput(body) {
     .setMimeType(ContentService.MimeType.JSON);
 }
 
+function getRequestIdColumn(sheet, rowDataLength) {
+  var lastColumn = Math.max(sheet.getLastColumn(), rowDataLength);
+  if (lastColumn > 0) {
+    var headers = sheet.getRange(1, 1, 1, lastColumn).getValues()[0];
+    for (var index = 0; index < headers.length; index++) {
+      if (cleanText(headers[index], "").toLowerCase() === "request_id") {
+        return index + 1;
+      }
+    }
+  }
+
+  var requestColumn = rowDataLength + 1;
+  var candidateHeader = cleanText(sheet.getRange(1, requestColumn).getValue(), "");
+  if (candidateHeader !== "" && candidateHeader.toLowerCase() !== "request_id") {
+    requestColumn = lastColumn + 1;
+  }
+  sheet.getRange(1, requestColumn).setValue("Request_ID");
+  return requestColumn;
+}
+
+function sheetContainsRequestId(sheet, requestColumn, requestId) {
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) {
+    return false;
+  }
+
+  var requestIds = sheet.getRange(2, requestColumn, lastRow - 1, 1).getValues();
+  for (var index = 0; index < requestIds.length; index++) {
+    if (cleanText(requestIds[index][0], "") === requestId) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function appendRowIdempotently(sheet, rowData, requestId) {
+  if (!requestId) {
+    sheet.appendRow(rowData);
+    return { appended: true, deduplicated: false };
+  }
+
+  var requestColumn = getRequestIdColumn(sheet, rowData.length);
+  if (sheetContainsRequestId(sheet, requestColumn, requestId)) {
+    return { appended: false, deduplicated: true };
+  }
+
+  var storedRow = rowData.slice();
+  while (storedRow.length < requestColumn) {
+    storedRow.push("");
+  }
+  storedRow[requestColumn - 1] = requestId;
+  sheet.appendRow(storedRow);
+  return { appended: true, deduplicated: false };
+}
+
+function driveQueryText(value) {
+  return cleanText(value, "").replace(/'/g, "\\'");
+}
+
+function pdfPreviewUrl(file) {
+  file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+  return "https://drive.google.com/file/d/" + file.getId() + "/preview";
+}
+
+function findLatestPdfFileForShift(shiftId) {
+  var folder = DriveApp.getFolderById(PDF_FOLDER_ID);
+  var safeShiftId = driveQueryText(shiftId);
+  var files = folder.searchFiles(
+    "title contains '" + safeShiftId + "' and mimeType = 'application/pdf'"
+  );
+  var expectedPrefix = "PRS_" + cleanText(shiftId, "") + "_";
+  var stableName = "PRS_" + cleanText(shiftId, "") + ".pdf";
+  var latestFile = null;
+  var latestDate = 0;
+
+  while (files.hasNext()) {
+    var currentFile = files.next();
+    var currentName = currentFile.getName();
+    if (currentName !== stableName && currentName.indexOf(expectedPrefix) !== 0) {
+      continue;
+    }
+    var fileDate = currentFile.getDateCreated().getTime();
+    if (fileDate > latestDate) {
+      latestDate = fileDate;
+      latestFile = currentFile;
+    }
+  }
+
+  return latestFile;
+}
+
 function doPost(e) {
   var lock = LockService.getScriptLock();
   var lockAcquired = false;
@@ -68,12 +159,13 @@ function doPost(e) {
         throw new Error("Could not find '" + tabName + "' tab.");
       }
 
-      sheet.appendRow(payload.row_data);
+      var appendResult = appendRowIdempotently(sheet, payload.row_data, requestId);
       SpreadsheetApp.flush();
       responseBody = {
         "status": "success",
-        "message": "Row appended.",
+        "message": appendResult.deduplicated ? "Duplicate request ignored." : "Row appended.",
         "tab_name": tabName,
+        "deduplicated": appendResult.deduplicated,
         "request_id": requestId || null
       };
     } else if (action === "GENERATE_PDF") {
@@ -82,11 +174,14 @@ function doPost(e) {
         throw new Error("Missing shift_id.");
       }
 
-      var pdfUrl = generateShiftPDF(shiftId);
+      var forceRegenerate = payload.force_regenerate === true;
+      var existingPdf = forceRegenerate ? null : findLatestPdfFileForShift(shiftId);
+      var pdfUrl = existingPdf ? pdfPreviewUrl(existingPdf) : generateShiftPDF(shiftId);
       responseBody = {
         "status": "success",
-        "message": "PDF generated.",
+        "message": existingPdf ? "Existing PDF returned." : "PDF generated.",
         "url": pdfUrl,
+        "deduplicated": Boolean(existingPdf),
         "request_id": requestId || null
       };
     } else if (action === "GET_SHIFT_LIST") {
@@ -112,22 +207,7 @@ function doPost(e) {
         throw new Error("Missing shift_id.");
       }
 
-      var pdfFolder = DriveApp.getFolderById(PDF_FOLDER_ID);
-      var safeShiftId = requestedShiftId.replace(/'/g, "\\'");
-      var matchingFiles = pdfFolder.searchFiles(
-        "title contains '" + safeShiftId + "' and mimeType = 'application/pdf'"
-      );
-      var latestFile = null;
-      var latestDate = 0;
-
-      while (matchingFiles.hasNext()) {
-        var currentFile = matchingFiles.next();
-        var fileDate = currentFile.getDateCreated().getTime();
-        if (fileDate > latestDate) {
-          latestDate = fileDate;
-          latestFile = currentFile;
-        }
-      }
+      var latestFile = findLatestPdfFileForShift(requestedShiftId);
 
       if (!latestFile) {
         responseBody = {
@@ -135,13 +215,9 @@ function doPost(e) {
           "message": "No PDF found for this shift yet."
         };
       } else {
-        latestFile.setSharing(
-          DriveApp.Access.ANYONE_WITH_LINK,
-          DriveApp.Permission.VIEW
-        );
         responseBody = {
           "status": "success",
-          "url": "https://drive.google.com/file/d/" + latestFile.getId() + "/preview"
+          "url": pdfPreviewUrl(latestFile)
         };
       }
     } else {
@@ -270,13 +346,42 @@ function appendUnique(values, value) {
   }
 }
 
+function dataRowFingerprint(row, fieldCount) {
+  var values = [];
+  for (var index = 0; index < fieldCount; index++) {
+    var value = row[index];
+    if (value instanceof Date) {
+      values.push("date:" + value.getTime());
+    } else {
+      values.push(typeof value + ":" + cleanText(value, ""));
+    }
+  }
+  return JSON.stringify(values);
+}
+
+function isRepeatedDataRow(seenRows, row, fieldCount) {
+  var requestId = cleanText(row[fieldCount], "");
+  var fingerprint = requestId !== ""
+    ? "request:" + requestId
+    : "legacy:" + dataRowFingerprint(row, fieldCount);
+  if (Object.prototype.hasOwnProperty.call(seenRows, fingerprint)) {
+    return true;
+  }
+  seenRows[fingerprint] = true;
+  return false;
+}
+
 function aggregateHourlyData(data, shiftId, rowMap) {
   var hours = {};
   var modelTotals = {};
+  var seenRows = {};
 
   for (var index = 1; index < data.length; index++) {
     var row = data[index];
     if (!sameShiftId(row[0], shiftId)) {
+      continue;
+    }
+    if (isRepeatedDataRow(seenRows, row, 8)) {
       continue;
     }
 
@@ -415,10 +520,14 @@ function writeHourlyData(sheet, data, shiftId, rowMap) {
 
 function aggregateRejectData(data, shiftId, rowMap) {
   var hours = {};
+  var seenRows = {};
 
   for (var index = 1; index < data.length; index++) {
     var row = data[index];
     if (!sameShiftId(row[0], shiftId)) {
+      continue;
+    }
+    if (isRepeatedDataRow(seenRows, row, 10)) {
       continue;
     }
 
@@ -507,10 +616,14 @@ function newDowntimeBucket() {
 
 function aggregateDowntimeData(data, shiftId, rowMap) {
   var hours = {};
+  var seenRows = {};
 
   for (var index = 1; index < data.length; index++) {
     var row = data[index];
     if (!sameShiftId(row[0], shiftId)) {
+      continue;
+    }
+    if (isRepeatedDataRow(seenRows, row, 7)) {
       continue;
     }
 
