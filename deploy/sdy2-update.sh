@@ -3,7 +3,7 @@
 # fast-forward, install, test, restart, and roll back if anything fails.
 #
 # Usage (as root, normally via sdy2-update@<user>.service):
-#   /usr/local/sbin/sdy2-update.sh <linux-user> [--stash-local-edits]
+#   /usr/local/sbin/sdy2-update.sh <linux-user> [--stash-local-edits] [--force]
 #
 # Local code edits on the Pi normally stop the update. With --stash-local-edits
 # they are saved with "git stash" (recoverable: git stash list / git stash show -p)
@@ -11,14 +11,24 @@
 #
 # A "safe moment" is: no active shift, or the line is in REST / PLANNED STOP.
 # While the line is producing the script waits and checks again every minute.
+# --force skips that wait and restarts even during an active shift. Counts and
+# the shift are restored from SQLite after the restart; only pieces made during
+# the few seconds the tracker is down are not counted. Tests and rollback still run.
 #
 # This file is installed as a COPY in /usr/local/sbin so that "git pull" never
 # rewrites the script while it is running.
 set -euo pipefail
 
-APP_USER="${1:?usage: sdy2-update.sh <linux-user> [--stash-local-edits]}"
+APP_USER="${1:?usage: sdy2-update.sh <linux-user> [--stash-local-edits] [--force]}"
 STASH_LOCAL_EDITS="no"
-if [ "${2:-}" = "--stash-local-edits" ]; then STASH_LOCAL_EDITS="yes"; fi
+FORCE="no"
+for arg in "${@:2}"; do
+  case "$arg" in
+    --stash-local-edits) STASH_LOCAL_EDITS="yes" ;;
+    --force) FORCE="yes" ;;
+    *) echo "unknown option: $arg (use --stash-local-edits and/or --force)" >&2; exit 2 ;;
+  esac
+done
 APP_DIR="${SDY2_APP_DIR:-/home/$APP_USER/sdy2}"
 SERVICE="sdy2@$APP_USER.service"
 VENV_PY="$APP_DIR/.venv/bin/python"
@@ -57,6 +67,10 @@ print("line busy: shift %s, mode %s" % (status, mode)); sys.exit(1)
 '
 
 wait_for_safe_moment() {
+  if [ "$FORCE" = "yes" ]; then
+    log "FORCED: restarting without waiting ($(python3 -c "$SAFE_CHECK" "$DB_PATH" || true))."
+    return 0
+  fi
   local deadline=$(( $(date +%s) + MAX_WAIT_MINUTES * 60 ))
   local reason
   while true; do

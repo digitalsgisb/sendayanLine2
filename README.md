@@ -134,6 +134,19 @@ sudo systemctl start --no-block "sdy2-update@$USER.service"
 tail -f /var/log/sdy2-update.log
 ```
 
+To update **now, even during an active shift**, add `--force`. It skips the
+safe-moment wait but still tests and rolls back on failure. The shift and its
+counts are restored after the restart; pieces made during the few seconds the
+tracker is down are not counted.
+
+```bash
+cd "$HOME/sdy2" && git fetch origin main
+git show origin/main:deploy/sdy2-update.sh | sudo install -m 0755 /dev/stdin /usr/local/sbin/sdy2-update.sh
+sudo /usr/local/sbin/sdy2-update.sh "$USER" --force
+```
+
+The first two lines refresh the installed updater copy (needed once, so it knows `--force`).
+
 If the service does not start, inspect its latest logs:
 
 ```bash
