@@ -104,6 +104,9 @@ MQTT_TOPIC_NR_ENDSHIFT = "nodered/endshift"
 MQTT_TOPIC_MODE = "nodered/mode"
 MQTT_TOPIC_PARAM_CONDITION = "noderedparam/condition"
 MQTT_TOPIC_ADJUST_COUNT = "nodered/adjust_count"
+# Smart Checksheet only (password checked there): end the active shift now and start a new one.
+# Deliberately not nodered/endshift, so the Node-RED OEE flow is not reset a second time.
+MQTT_TOPIC_SHIFT_OVERRIDE = "checksheet/shift_override"
 
 MQTT_TOPIC_LIVE_HOURLY = "smartchecksheet/hourly"
 MQTT_TOPIC_LIVE_SNAPSHOT = "smartchecksheet/live"
@@ -828,12 +831,12 @@ def publish_shift_form_result(status, data, message="", navigate_to_hourly=True)
         print(f"[SHIFT ACK ERROR] {exc}")
 
 
-def apply_shift_form(data, navigate_to_hourly=True):
+def apply_shift_form(data, navigate_to_hourly=True, shift_id_override=None, started_at=None):
     """Activate a validated form, preserving a matching late-entry buffer."""
     global current_shift
     expire_shift_entry_window()
     previous_shift_id = current_shift.get("shift_id", "NO PROD")
-    new_shift_id = shift_id_for_form(data)
+    new_shift_id = shift_id_override or shift_id_for_form(data)
     if previous_shift_id != "NO PROD" and previous_shift_id != new_shift_id:
         print("[SHIFT WARNING] A different shift is already active. The new form was rejected to preserve its counters.")
         publish_shift_form_result("rejected", data, "Another shift is still active.")
@@ -841,9 +844,9 @@ def apply_shift_form(data, navigate_to_hourly=True):
     adopting_shift_buffer = previous_shift_id == "NO PROD" and shift_entry_window_is_active()
     current_shift["shift_id"] = new_shift_id
     current_shift["source_form"] = dict(data)
-    current_shift["scheduled_start_at"] = calculate_shift_start_datetime(
+    current_shift["scheduled_start_at"] = (started_at or calculate_shift_start_datetime(
         data.get("prodDate"), data.get("shift"), data.get("overtime", False), data.get("workingTime")
-    ).isoformat()
+    )).isoformat()
     current_shift.update({
         "date": data.get("prodDate", "-"),
         "line": data.get("productionLine", "-"),
@@ -947,6 +950,49 @@ def receive_shift_form(data, moment=None, navigate_to_hourly=True):
         if pending_shift_form is not None and shift_id_for_form(pending_shift_form) == new_id:
             pending_shift_form = None
         return apply_shift_form(data, navigate_to_hourly=navigate_to_hourly)
+
+
+def next_override_shift_id(base_id, ending_id):
+    """Give a restarted shift its own ID so Sheets rows, PDFs and checksheet records stay separate."""
+    if ending_id != base_id and not ending_id.startswith(base_id + "-R"):
+        return base_id
+    suffix = ending_id[len(base_id) + 2:]
+    return f"{base_id}-R{(int(suffix) if suffix.isdigit() else 1) + 1}"
+
+
+def override_shift(data, moment=None):
+    """Smart Checksheet override: end the active shift now and start this shift at once, from zero."""
+    global pending_shift_form, last_production_day
+    moment = moment or datetime.now()
+    with shift_state_lock:
+        reason = str(data.get("overrideReason") or "").strip()[:200]
+        if not reason:
+            publish_shift_form_result("rejected", data, "A reason is required to end and start a new shift.")
+            return False
+        try:
+            start = calculate_shift_start_datetime(data.get("prodDate"), data.get("shift"),
+                                                   data.get("overtime", False), data.get("workingTime"))
+            end = calculate_shift_end_datetime(data.get("prodDate"), data.get("shift"),
+                                               data.get("overtime", False), data.get("workingTime"))
+        except (ValueError, TypeError) as exc:
+            publish_shift_form_result("rejected", data, str(exc))
+            return False
+        if moment >= end:
+            publish_shift_form_result("rejected", data, "This shift has already ended. Check the production date.")
+            return False
+        ending_id = current_shift.get("shift_id", "NO PROD")
+        print(f"\n[MQTT EVENT] Shift override from Smart Checksheet by {data.get('overrideBy', '-')}: {reason}")
+        if ending_id != "NO PROD":
+            execute_end_shift(end_reason="OVERRIDE SHIFT END")
+        # Start from zero: never adopt production buffered before the override.
+        reset_production_runtime_counters()
+        clear_shift_entry_window()
+        if production_day_key(moment) != last_production_day:
+            force_production_day_reset(moment)
+            last_production_day = production_day_key(moment)
+        pending_shift_form = None
+        return apply_shift_form(data, shift_id_override=next_override_shift_id(shift_id_for_form(data), ending_id),
+                                started_at=moment if moment < start else None)
 
 
 def advance_shift_schedule(moment=None):
@@ -1067,7 +1113,7 @@ def on_connect(client, userdata, flags, rc):
     client.subscribe([(MQTT_TOPIC_SHIFT_FORM, 0), (MQTT_TOPIC_SETUP, 0),
                       (MQTT_TOPIC_NR_REJECT, 0), (MQTT_TOPIC_NR_DOWNTIME, 0),
                       (MQTT_TOPIC_NR_ENDSHIFT, 0), (MQTT_TOPIC_MODE, 0),
-                      (MQTT_TOPIC_PARAM_CONDITION, 0), (MQTT_TOPIC_ADJUST_COUNT, 0),
+                      (MQTT_TOPIC_PARAM_CONDITION, 0), (MQTT_TOPIC_ADJUST_COUNT, 0), (MQTT_TOPIC_SHIFT_OVERRIDE, 0),
                       (MQTT_TOPIC_DOWNTIME_SESSION, 1), (MQTT_TOPIC_CONFIG, 1)])
     client.publish(
         MQTT_TOPIC_STATUS,
@@ -1135,6 +1181,9 @@ def on_message(client, userdata, msg):
 
         elif topic == MQTT_TOPIC_SHIFT_FORM and is_json:
             receive_shift_form(data)
+
+        elif topic == MQTT_TOPIC_SHIFT_OVERRIDE and is_json:
+            override_shift(data)
 
         elif topic == MQTT_TOPIC_SETUP and is_json:
             if "model" in data: current_shift["model"] = data.get("model", "-")

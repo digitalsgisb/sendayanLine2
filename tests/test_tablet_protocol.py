@@ -187,5 +187,70 @@ class TabletProtocolTests(unittest.TestCase):
         self.assertIn("shift.ended", kinds)
 
 
+
+class ShiftOverrideTests(unittest.TestCase):
+    """checksheet/shift_override: end the active shift now and start the given one from zero."""
+    setUp = TabletProtocolTests.setUp
+    tearDown = TabletProtocolTests.tearDown
+
+    def override(self, **changes):
+        data = form(**{k: changes.pop(k) for k in ("date", "shift", "overtime", "hours") if k in changes})
+        data.update({"overrideReason": "Wrong team", "overrideBy": "Developer", "event_id": "cmd-1"}, **changes)
+        return data
+
+    def test_listens_for_the_override_topic(self):
+        self.g["on_connect"](RecordingMQTTClient(), None, None, 0)
+        topics = [entry for name, entry in PUBLISHED if name == "SUBSCRIBE"][0]
+        self.assertIn(("checksheet/shift_override", 0), topics)
+
+    def test_next_override_shift_id(self):
+        nxt = self.g["next_override_shift_id"]
+        self.assertEqual(nxt("20261110-Day-SendayanLine2", "NO PROD"), "20261110-Day-SendayanLine2")
+        self.assertEqual(nxt("20261110-Night-SendayanLine2", "20261110-Day-SendayanLine2"), "20261110-Night-SendayanLine2")
+        self.assertEqual(nxt("20261110-Day-SendayanLine2", "20261110-Day-SendayanLine2"), "20261110-Day-SendayanLine2-R2")
+        self.assertEqual(nxt("20261110-Day-SendayanLine2", "20261110-Day-SendayanLine2-R2"), "20261110-Day-SendayanLine2-R3")
+
+    def test_override_ends_active_shift_and_restarts_it_from_zero(self):
+        ended = []
+        self.g["receive_shift_form"](form(), datetime(2026, 11, 10, 9, 0))
+        self.g["execute_end_shift"] = lambda **kwargs: (ended.append(kwargs), self.g["reset_shift_data"]())
+        self.g.update(shift_total_output=40, total_output=40, hourly_output=7)
+        self.assertTrue(self.g["override_shift"](self.override(supervisor="New"), datetime(2026, 11, 10, 10, 0)))
+        self.assertEqual(ended, [{"end_reason": "OVERRIDE SHIFT END"}])
+        self.assertEqual(self.g["current_shift"]["shift_id"], "20261110-Day-SendayanLine2-R2")
+        self.assertEqual(self.g["current_shift"]["supervisor"], "New")
+        self.assertEqual((self.g["shift_total_output"], self.g["total_output"], self.g["hourly_output"]), (0, 0, 0))
+        self.assertEqual(results("sdy2/shift_form_result")[-1]["status"], "active")
+        self.assertEqual(self.events[-1][0], "shift.started")
+
+    def test_override_can_start_night_before_its_usual_time(self):
+        self.g["receive_shift_form"](form(), datetime(2026, 11, 10, 9, 0))
+        self.g["execute_end_shift"] = lambda **kwargs: self.g["reset_shift_data"]()
+        night = self.override(shift="Night", hours="4:15 PM to 12:30 AM")
+        self.assertTrue(self.g["override_shift"](night, datetime(2026, 11, 10, 14, 0)))
+        self.assertEqual(self.g["current_shift"]["shift_id"], "20261110-Night-SendayanLine2")
+        self.assertEqual(self.g["current_shift"]["scheduled_start_at"], "2026-11-10T14:00:00")
+        self.assertIsNone(self.g["pending_shift_form"])
+
+    def test_override_without_reason_or_after_shift_end_changes_nothing(self):
+        moment = datetime(2026, 11, 10, 10, 0)
+        self.g["receive_shift_form"](form(), moment)
+        self.g["shift_total_output"] = 9
+        events = len(self.events)
+        self.assertFalse(self.g["override_shift"](self.override(overrideReason=" "), moment))
+        self.assertFalse(self.g["override_shift"](self.override(date="2026-11-09"), moment))
+        self.assertEqual([r["status"] for r in results("sdy2/shift_form_result")[-2:]], ["rejected", "rejected"])
+        self.assertEqual(self.g["current_shift"]["shift_id"], "20261110-Day-SendayanLine2")
+        self.assertEqual(self.g["shift_total_output"], 9)
+        self.assertEqual(len(self.events), events)
+
+    def test_override_arrives_through_mqtt(self):
+        self.g["receive_shift_form"](form(), datetime(2026, 11, 10, 9, 0))
+        self.g["execute_end_shift"] = lambda **kwargs: self.g["reset_shift_data"]()
+        self.g["override_shift"] = lambda data, moment=None: PUBLISHED.append(("OVERRIDE", data["overrideReason"]))
+        self.g["on_message"](None, None, message("checksheet/shift_override", self.override()))
+        self.assertIn(("OVERRIDE", "Wrong team"), PUBLISHED)
+
+
 if __name__ == "__main__":
     unittest.main()
