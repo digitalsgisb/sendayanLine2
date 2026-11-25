@@ -11,6 +11,7 @@ import paho.mqtt.client as mqtt
 import requests
 
 from sdy_downtime_session import empty_session, transition as downtime_transition
+import sdy_hourly_plan as hourly_plan
 from sdy_google_sender import GoogleSheetsSender, MemoryGoogleQueue
 from sdy_persistence import ProductionOutboxSender, ProductionSQLiteStore
 from sdy_shift_schedule import (
@@ -70,6 +71,8 @@ wj2_count = 0               # Waterjet 2 model count (GPIO27)
 hourly_rest_time = 0.0
 lost_time_this_hour = 0.0 
 base_time_this_hour = 0.0   # Accurately tracks base time even if model changes mid-hour
+# Fixed hourly plan: planned seconds (rest, planned stop, model change) in the running segment, and when it started.
+hourly_plan_state = {"planned_lost": 0.0, "segment_started_at": None}
 
 # Sensor & Cycle Trackers
 sensor_blocked = False
@@ -333,6 +336,8 @@ def build_runtime_snapshot():
             "hourly_rest_time": hourly_rest_time,
             "lost_time_this_hour": lost_time_this_hour,
             "base_time_this_hour": base_time_this_hour,
+            "planned_lost_this_hour": hourly_plan_state["planned_lost"],
+            "segment_started_at": hourly_plan_state["segment_started_at"],
         },
         "saved_at": datetime.now().astimezone().isoformat(),
     }
@@ -440,6 +445,7 @@ def restore_runtime_state():
     hourly_rest_time = float(timers.get("hourly_rest_time", 0.0))
     lost_time_this_hour = float(timers.get("lost_time_this_hour", 0.0))
     base_time_this_hour = float(timers.get("base_time_this_hour", 0.0))
+    hourly_plan_state.update(planned_lost=float(timers.get("planned_lost_this_hour", 0.0)), segment_started_at=timers.get("segment_started_at"))
     downtime_session = snapshot.get("downtime_session") or empty_session()
     pending_shift_form = snapshot.get("pending_shift_form")
     if not isinstance(pending_shift_form, dict):
@@ -534,6 +540,7 @@ def reset_production_runtime_counters():
     wj1_prev = GPIO.input(PROX_SENSOR_1_PIN)
     wj2_prev = GPIO.input(PROX_SENSOR_2_PIN)
     hourly_rest_time = lost_time_this_hour = base_time_this_hour = 0.0
+    hourly_plan_state.update(planned_lost=0.0, segment_started_at=None)
     real_operating_time = total_real_operating_time = current_cycle_time = batch_run_time = 0.0
     sensor_blocked = False
     limit_switch_prev = 1
@@ -734,6 +741,33 @@ def execute_end_shift(hour_slot_override=None, end_reason="MANUAL SHIFT END"):
     })
     print(f"[GOOGLE QUEUE] PDF generation queued for Shift: {ending_shift_id}.")
 
+def current_segment_plan(now=None, closing=False, standard=False):
+    """(plan, segment end) under the fixed-plan rule; the shift's own start and end bound the hour."""
+    return hourly_plan.segment_plan(
+        now or datetime.now(), hourly_plan_state["segment_started_at"],
+        current_shift.get("scheduled_start_at"), get_current_shift_end_datetime(),
+        hourly_plan_state["planned_lost"], current_shift.get("standard_cycle", 1.0),
+        closing=closing, standard=standard)
+
+
+def close_segment_for_setup(data):
+    """A new model or lot gets its own hourly row: close the running one under the old model/lot first."""
+    if current_shift.get("shift_id") == "NO PROD":
+        return
+    old_model, old_lot = current_shift.get("model"), current_shift.get("lot_number")
+    new_model = data.get("model", old_model) if "model" in data else old_model
+    new_lot = data.get("lot_number", old_lot) if "lot_number" in data else old_lot
+    if (new_model, new_lot) == (old_model, old_lot) or str(old_model or "-").strip().upper() in ("-", "", "NO PROD", "PENDING", "UNKNOWN"):
+        return
+    # Changeover time with nothing made yet belongs to the new model's row.
+    if hourly_output <= 0 and (current_mode == MODE_MODEL_CHANGE or base_time_this_hour < 30):
+        return
+    if new_model != old_model:
+        push_hourly_to_sheets(is_model_change=True, reason_override="MODEL CHANGE")
+    else:
+        push_hourly_to_sheets(hour_slot_override=get_hour_slot(), reason_override="LOT CHANGE")
+
+
 def push_hourly_to_sheets(
     is_model_change=False,
     hour_slot_override=None,
@@ -746,7 +780,8 @@ def push_hourly_to_sheets(
     lost_minutes = lost_time_this_hour / 60.0
     available_minutes = max(0.0, base_minutes - lost_minutes)
     
-    plan_output = int(available_minutes / std_cycle) if std_cycle > 0 else 0
+    # Fixed plan: minutes of this hour/segment inside the shift, less planned time only (see the hourly_plan module).
+    plan_output, plan_segment_end = current_segment_plan(closing=bool(hour_slot_override or is_model_change), standard=not (hour_slot_override or is_model_change))
     now = datetime.now()
     
     if hour_slot_override:
@@ -791,6 +826,7 @@ def push_hourly_to_sheets(
     lost_time_this_hour = 0.0
     base_time_this_hour = 0.0
     hourly_rest_time = 0.0
+    hourly_plan_state.update(planned_lost=0.0, segment_started_at=plan_segment_end.isoformat())
     
     if is_model_change:
         print("[EVENT] Model Change Flag triggered -> Resetting Total Output and Real Operating Time to 0.")
@@ -1186,6 +1222,7 @@ def on_message(client, userdata, msg):
             override_shift(data)
 
         elif topic == MQTT_TOPIC_SETUP and is_json:
+            close_segment_for_setup(data)
             if "model" in data: current_shift["model"] = data.get("model", "-")
             if "lot_number" in data: current_shift["lot_number"] = data.get("lot_number", "-")
             if "hourly_plan" in data:
@@ -1442,6 +1479,8 @@ def publish_live_data():
     live_available_minutes = max(0.0, live_base_minutes - live_lost_minutes)
     live_plan = int(live_available_minutes / standard_cycle) if standard_cycle > 0 else 0
     full_hour_plan = int(60.0 / standard_cycle) if standard_cycle > 0 else 0
+    # The plan shown on the tablet is fixed for the hour (planned stops only lower it), not the minutes so far.
+    live_plan = current_segment_plan()[0]
 
     payload = {
         "shift_id": current_shift["shift_id"],
@@ -1570,6 +1609,8 @@ try:
         base_time_this_hour += production_loop_delta
         total_machine_time += production_loop_delta
         
+        if current_mode in (MODE_REST, MODE_PLANNED_STOP, MODE_MODEL_CHANGE):
+            hourly_plan_state["planned_lost"] += production_loop_delta
         if current_mode in [MODE_NORMAL, MODE_DOWN]:
             real_operating_time += production_loop_delta
             total_real_operating_time += production_loop_delta
