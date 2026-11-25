@@ -67,5 +67,18 @@ class FixedPlanTrackerTests(unittest.TestCase):
         self.assertEqual(results("smartchecksheet/hourly"), [])
 
 
+    def test_one_changeover_makes_no_empty_rows(self):
+        """25/11 SDY1: Model Change on, off, model sent, on again, model sent again - four empty rows before; none now."""
+        self.g["hourly_output"], self.g["base_time_this_hour"], self.g["total_output"] = 0, 5 * 60, 120
+        message = lambda topic, payload: self.g["on_message"](None, None, type("M", (), {"topic": topic, "payload": payload})())
+        message(self.g["MQTT_TOPIC_MODE"], b"MODEL CHANGE")
+        message(self.g["MQTT_TOPIC_MODE"], b"NORMAL")
+        message("nodered/modeltarget", b'{"model": "3N0_HEV", "lot_number": "4G.0281-A"}')
+        message(self.g["MQTT_TOPIC_MODE"], b"MODEL CHANGE")
+        message("nodered/modeltarget", b'{"model": "3N0_HEV", "lot_number": "4G.0281-A"}')
+        self.assertEqual(results("smartchecksheet/hourly"), [])
+        self.assertEqual((self.g["current_shift"]["model"], self.g["total_output"]), ("3N0_HEV", 0))
+
+
 if __name__ == "__main__":
     unittest.main()

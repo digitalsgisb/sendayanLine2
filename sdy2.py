@@ -759,13 +759,26 @@ def close_segment_for_setup(data):
     new_lot = data.get("lot_number", old_lot) if "lot_number" in data else old_lot
     if (new_model, new_lot) == (old_model, old_lot) or str(old_model or "-").strip().upper() in ("-", "", "NO PROD", "PENDING", "UNKNOWN"):
         return
-    # Changeover time with nothing made yet belongs to the new model's row.
-    if hourly_output <= 0 and (current_mode == MODE_MODEL_CHANGE or base_time_this_hour < 30):
+    # Nothing made yet under the old model/lot: no row. The time (changeover included) belongs to the new one.
+    if hourly_output <= 0:
+        if new_model != old_model:
+            reset_model_counters()
         return
     if new_model != old_model:
         push_hourly_to_sheets(is_model_change=True, reason_override="MODEL CHANGE")
     else:
         push_hourly_to_sheets(hour_slot_override=get_hour_slot(), reason_override="LOT CHANGE")
+
+
+def reset_model_counters():
+    """The per-model totals start again for a new model (what push_hourly_to_sheets does on a model change)."""
+    global batch_run_time, mf_count, real_operating_time, total_output, wj1_count, wj2_count
+    print("[EVENT] New model -> Resetting Total Output and Real Operating Time to 0.")
+    total_output = 0
+    mf_count = 0
+    wj1_count = wj2_count = 0
+    batch_run_time = 0.0
+    real_operating_time = 0.0
 
 
 def push_hourly_to_sheets(
@@ -1113,8 +1126,7 @@ def process_downtime_command(command, automatic=False):
         try:
             updated, effects = downtime_transition(downtime_session, command, now_ms,
                                                     current_shift.get("shift_id", "NO PROD"), automatic)
-            if effects["mode"] == MODE_MODEL_CHANGE and current_mode != MODE_MODEL_CHANGE:
-                push_hourly_to_sheets(is_model_change=True)
+            # Model Change mode no longer closes the hourly row: the model/lot change itself does (close_segment_for_setup).
             downtime_session = updated
             if effects["mode"] is not None:
                 current_mode = effects["mode"]
@@ -1332,8 +1344,7 @@ def on_message(client, userdata, msg):
             new_mode = str(data).upper()
             valid_modes = [MODE_NORMAL, MODE_DOWN, MODE_MODEL_CHANGE, MODE_REST, MODE_PLANNED_STOP]
             if new_mode in valid_modes:
-                if new_mode == MODE_MODEL_CHANGE and current_mode != MODE_MODEL_CHANGE:
-                    push_hourly_to_sheets(is_model_change=True)
+                # Model Change mode no longer closes the hourly row: the model/lot change itself does (close_segment_for_setup).
                 
                 if current_mode != new_mode:
                     current_mode = new_mode
